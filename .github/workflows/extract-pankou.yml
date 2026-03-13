@@ -1,0 +1,203 @@
+name: Extract Base Pankou
+
+on:
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "日期: YYYYMMDD 或 YYYYMMDD~YYYYMMDD, 多个逗号分隔, 留空=当天"
+        required: false
+        type: string
+      force:
+        description: "强制提取 (已存在也重新提取)"
+        required: false
+        type: boolean
+        default: false
+      shards:
+        description: "每个日期的股票分片数 (1~20, 子 workflow 并行 job 数, 推荐 20)"
+        required: false
+        default: "20"
+        type: string
+  # schedule:
+  #   - cron: "30 8 * * 1-5"  # UTC 8:30 = 北京 16:30
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      dates: ${{ steps.resolve.outputs.dates }}
+      date_matrix: ${{ steps.matrix.outputs.dates }}
+    steps:
+      - name: 检出 stock-grabber 依赖
+        uses: actions/checkout@v4
+        with:
+          repository: hiyishui/stock-grabber
+          token: ${{ secrets.GRABBER_PAT }}
+          ref: main
+          fetch-depth: 1
+          filter: blob:none
+          path: .work/stock-grabber
+          sparse-checkout: |
+            data/trade_date.json
+            tools/dat_to_dataframe.py
+            tools/stock_shares_parquet.py
+            data/gb/guben.parquet
+            data/all_stocks.json
+            hicccx999/extract_base_pankou.py
+          sparse-checkout-cone-mode: false
+
+      - name: 检出 stock-mining 依赖
+        uses: actions/checkout@v4
+        with:
+          repository: hicccx999/stock-mining
+          token: ${{ secrets.HICCC_PAT }}
+          ref: main
+          fetch-depth: 1
+          filter: blob:none
+          path: .work/stock-mining
+          sparse-checkout: |
+            mining/dat_loader.py
+            mining/features_daily.py
+          sparse-checkout-cone-mode: false
+
+      - name: 打包共享源码依赖
+        run: |
+          set -euo pipefail
+          mkdir -p .work/sources
+          tar czf .work/sources/stock-grabber.tar.gz -C .work/stock-grabber \
+            tools data/gb data/all_stocks.json hicccx999
+          tar czf .work/sources/stock-mining.tar.gz -C .work/stock-mining \
+            mining
+
+      - name: 上传共享源码依赖
+        uses: actions/upload-artifact@v4
+        with:
+          name: shared-source-bundle
+          path: .work/sources/
+          retention-days: 1
+          compression-level: 0
+
+      - name: 解析日期 & 跳过已存在
+        id: resolve
+        run: |
+          set -euo pipefail
+
+          normalize_date() {
+            local raw="$1"
+            local compact
+            compact=$(echo "$raw" | tr -cd '0-9')
+            if [ "${#compact}" -ne 8 ]; then
+              return 1
+            fi
+            date -d "${compact:0:4}-${compact:4:2}-${compact:6:2}" +%Y%m%d 2>/dev/null || return 1
+          }
+
+          INPUT="${{ inputs.dates }}"
+          [ -z "$INPUT" ] && INPUT=$(TZ=Asia/Shanghai date +%Y%m%d)
+
+          ALL=""
+          IFS=',' read -ra PARTS <<< "$INPUT"
+          for part in "${PARTS[@]}"; do
+            part=$(echo "$part" | xargs)
+            if [[ "$part" == *"~"* ]]; then
+              S_RAW=$(echo "$part" | cut -d'~' -f1)
+              E_RAW=$(echo "$part" | cut -d'~' -f2)
+              S=$(normalize_date "$S_RAW") || { echo "❌ 无效日期: $S_RAW" >&2; exit 1; }
+              E=$(normalize_date "$E_RAW") || { echo "❌ 无效日期: $E_RAW" >&2; exit 1; }
+              if [[ "$S" -gt "$E" ]]; then
+                echo "❌ 日期范围起始晚于结束: $part" >&2
+                exit 1
+              fi
+              C="$S"
+              while [[ "$C" -le "$E" ]]; do
+                ALL="${ALL:+$ALL }$C"
+                C=$(date -d "${C:0:4}-${C:4:2}-${C:6:2} + 1 day" +%Y%m%d)
+              done
+            else
+              D=$(normalize_date "$part") || { echo "❌ 无效日期: $part" >&2; exit 1; }
+              ALL="${ALL:+$ALL }$D"
+            fi
+          done
+
+          TRADE_DATES=$(python3 -c "
+          import json
+          with open('.work/stock-grabber/data/trade_date.json') as f:
+              data = json.load(f)
+          for d in data['trade_dates']:
+              print(d.replace('-', ''))
+          ")
+
+          TRADING=""
+          for D in $ALL; do
+            if echo "$TRADE_DATES" | grep -qx "$D"; then
+              TRADING="${TRADING:+$TRADING }$D"
+            else
+              echo "⏭️ $D 非交易日, 跳过"
+            fi
+          done
+          ALL="$TRADING"
+
+          DEDUP=""
+          for D in $ALL; do
+            case " $DEDUP " in
+              *" $D "*) ;;
+              *) DEDUP="${DEDUP:+$DEDUP }$D" ;;
+            esac
+          done
+          ALL="$DEDUP"
+
+          FORCE="${{ inputs.force }}"
+          DATES="$ALL"
+          if [ "$FORCE" != "true" ]; then
+            DATES=""
+            for D in $ALL; do
+              YEAR=${D:0:4}
+              HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+                -H "Authorization: token ${{ secrets.LARKSELF_PAT }}" \
+                "https://api.github.com/repos/larkself/gp-features/contents/base/pankou/${YEAR}/${D}.parquet")
+              if [ "$HTTP_CODE" = "200" ]; then
+                echo "⏭️ $D 已存在, 跳过"
+              else
+                DATES="${DATES:+$DATES }$D"
+              fi
+            done
+          fi
+
+          echo "dates=$DATES" >> "$GITHUB_OUTPUT"
+          if [ -z "$DATES" ]; then
+            echo "✅ 所有日期已处理"
+          else
+            echo "📅 待处理: $DATES"
+          fi
+
+      - name: 生成日期 matrix
+        id: matrix
+        run: |
+          set -euo pipefail
+          DATES="${{ steps.resolve.outputs.dates }}"
+          if [ -z "$DATES" ]; then
+            echo 'dates=[]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          export DATES
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import os
+
+          dates = [d for d in os.environ["DATES"].split() if d]
+          print(f"dates={json.dumps(dates)}")
+          PY
+
+  extract-by-date:
+    needs: prepare
+    if: needs.prepare.outputs.dates != ''
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        date: ${{ fromJson(needs.prepare.outputs.date_matrix) }}
+    uses: ./.github/workflows/extract-pankou-by-date.yml
+    with:
+      date: ${{ matrix.date }}
+      shards: ${{ fromJson(inputs.shards || '20') }}
+    secrets: inherit
