@@ -10,8 +10,6 @@ on:
     secrets:
       GRABBER_PAT:
         required: true
-      HICCC_PAT:
-        required: true
       LARKSELF_PAT:
         required: true
 
@@ -37,21 +35,9 @@ jobs:
             tools/stock_shares_parquet.py
             data/gb/guben.parquet
             data/all_stocks.json
+            features/dat_loader.py
+            features/features_daily.py
             hicccx999/extract_base_pankou.py
-          sparse-checkout-cone-mode: false
-
-      - name: 检出 stock-mining 依赖
-        uses: actions/checkout@v4
-        with:
-          repository: hicccx999/stock-mining
-          token: ${{ secrets.HICCC_PAT }}
-          ref: main
-          fetch-depth: 1
-          filter: blob:none
-          path: stock-mining
-          sparse-checkout: |
-            mining/dat_loader.py
-            mining/features_daily.py
           sparse-checkout-cone-mode: false
 
       - name: 克隆日期仓库
@@ -104,7 +90,6 @@ jobs:
             --dat-dir date-repo \
             --output-dir output \
             --grabber-dir stock-grabber \
-            --mining-dir stock-mining \
             --all-stocks-json stock-grabber/data/all_stocks.json
 
           rm -rf date-repo
